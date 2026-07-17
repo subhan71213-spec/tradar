@@ -1,92 +1,104 @@
-"""Position entity.
+"""Shared fake providers for application-layer tests.
 
-A Position aggregates the net holding for a single symbol, derived from
-one or more Trades. It tracks quantity, weighted-average entry price, and
-running realized/unrealized P&L for that symbol within a Portfolio.
+These are simple test doubles (not mocks) that implement the same ports
+the real infrastructure adapters implement, so MarketDataService and the
+agents built on top of it can be exercised fully offline -- no network
+access is required to prove the orchestration, validation, and
+serialization logic is correct.
 """
 
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from titan_ai_trader.domain.enums.trade_side import TradeSide
-from titan_ai_trader.domain.exceptions.domain_exceptions import InvalidTradeError
+from titan_ai_trader.application.interfaces.fii_dii_provider import FiiDiiProvider
+from titan_ai_trader.application.interfaces.india_vix_provider import IndiaVixProvider
+from titan_ai_trader.application.interfaces.nse_spot_provider import NseSpotProvider
+from titan_ai_trader.application.interfaces.option_chain_provider import OptionChainProvider
+from titan_ai_trader.domain.entities.fii_dii_activity import FiiDiiActivity
+from titan_ai_trader.domain.entities.india_vix import IndiaVix
+from titan_ai_trader.domain.entities.market_quote import MarketQuote
+from titan_ai_trader.domain.entities.option_chain_snapshot import OptionChainSnapshot
+from titan_ai_trader.domain.entities.option_contract import OptionContract
+from titan_ai_trader.domain.enums.option_type import OptionType
+from titan_ai_trader.domain.exceptions.market_data_exceptions import SymbolNotFoundError
 from titan_ai_trader.domain.value_objects.money import Money
 
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+EXPIRY = date(2026, 7, 30)
 
 
-@dataclass(slots=True)
-class Position:
-    """Net open holding for one symbol."""
+def make_option_chain(symbol: str, timestamp: datetime | None = None) -> OptionChainSnapshot:
+    contracts = (
+        OptionContract(Decimal("24000"), OptionType.CE, EXPIRY, 1000, 50, 200, Decimal("14"), Money.of("120")),
+        OptionContract(Decimal("24000"), OptionType.PE, EXPIRY, 1500, 30, 150, Decimal("15"), Money.of("80")),
+        OptionContract(Decimal("24500"), OptionType.CE, EXPIRY, 2000, 100, 300, Decimal("13"), Money.of("60")),
+        OptionContract(Decimal("24500"), OptionType.PE, EXPIRY, 1200, -20, 100, Decimal("16"), Money.of("100")),
+    )
+    kwargs = dict(
+        symbol=symbol, expiry_date=EXPIRY, underlying_value=Money.of("24300"), contracts=contracts
+    )
+    if timestamp is not None:
+        kwargs["timestamp"] = timestamp
+    return OptionChainSnapshot(**kwargs)
 
-    symbol: str
-    side: TradeSide
-    quantity: Decimal
-    average_entry_price: Money
-    realized_pnl: Money = field(default_factory=lambda: Money.of(0))
 
-    trade_ids: list[str] = field(default_factory=list)
+class FakeSpotProvider(NseSpotProvider):
+    def __init__(self, timestamp: datetime | None = None) -> None:
+        self.timestamp = timestamp
 
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    opened_at: datetime = field(default_factory=_utcnow)
-    updated_at: datetime = field(default_factory=_utcnow)
-
-    def __post_init__(self) -> None:
-        if self.quantity <= 0:
-            raise InvalidTradeError("Position quantity must be positive.")
-
-    def is_flat(self) -> bool:
-        return self.quantity == 0
-
-    def add_fill(self, trade_id: str, fill_quantity: Decimal, fill_price: Money) -> None:
-        """Merge an additional fill into this position (adds to size).
-
-        Recomputes the weighted-average entry price.
-        """
-        if fill_quantity <= 0:
-            raise InvalidTradeError("Fill quantity must be positive.")
-
-        total_cost = (self.average_entry_price.amount * self.quantity) + (
-            fill_price.amount * fill_quantity
+    def get_spot(self, symbol: str, is_index: bool = False) -> MarketQuote:
+        kwargs = dict(
+            symbol=symbol, last_price=Money.of("24300"), change=Decimal("50"), change_percent=Decimal("0.2")
         )
-        new_quantity = self.quantity + fill_quantity
-        self.average_entry_price = Money.of(
-            total_cost / new_quantity, self.average_entry_price.currency
-        )
-        self.quantity = new_quantity
-        self.trade_ids.append(trade_id)
-        self._touch()
+        if self.timestamp is not None:
+            kwargs["timestamp"] = self.timestamp
+        return MarketQuote(**kwargs)
 
-    def reduce(self, close_quantity: Decimal, exit_price: Money) -> Money:
-        """Reduce position size (partial or full close) and return the
-        realized P&L for the reduced portion."""
-        if close_quantity <= 0 or close_quantity > self.quantity:
-            raise InvalidTradeError("Invalid close quantity for this position.")
 
-        diff = exit_price.amount - self.average_entry_price.amount
-        if self.side == TradeSide.SHORT:
-            diff = -diff
-        pnl = Money.of(diff * close_quantity, exit_price.currency)
+class FakeOptionChainProvider(OptionChainProvider):
+    def __init__(self, timestamp: datetime | None = None) -> None:
+        self.timestamp = timestamp
 
-        self.realized_pnl = self.realized_pnl + pnl
-        self.quantity = self.quantity - close_quantity
-        self._touch()
-        return pnl
+    def get_option_chain(self, symbol: str, expiry_date=None) -> OptionChainSnapshot:
+        return make_option_chain(symbol, self.timestamp)
 
-    def unrealized_pnl(self, current_price: Money) -> Money:
-        diff = current_price.amount - self.average_entry_price.amount
-        if self.side == TradeSide.SHORT:
-            diff = -diff
-        return Money.of(diff * self.quantity, current_price.currency)
 
-    def market_value(self, current_price: Money) -> Money:
-        return Money.of(current_price.amount * self.quantity, current_price.currency)
+class FakeVixProvider(IndiaVixProvider):
+    def get_vix(self) -> IndiaVix:
+        return IndiaVix(value=Decimal("13.5"), change=Decimal("0.1"), change_percent=Decimal("0.7"))
 
-    def _touch(self) -> None:
-        self.updated_at = _utcnow()
+
+class FakeFiiDiiProvider(FiiDiiProvider):
+    """Backed by a small in-memory {date: FiiDiiActivity} table so tests
+    can exercise previous-day lookback and holiday-skipping behavior.
+
+    Dates default to "today"/"yesterday" (computed at construction time,
+    not hardcoded) so these fixtures never go stale relative to
+    FreshnessValidator's real wall-clock check just because real time
+    has moved past whatever date was hardcoded when the test was written.
+    """
+
+    def __init__(self, activity_by_date: dict[date, FiiDiiActivity] | None = None) -> None:
+        if activity_by_date is not None:
+            self.activity_by_date = activity_by_date
+            return
+        today = datetime.now(UTC).date()
+        yesterday = today - timedelta(days=1)
+        self.activity_by_date = {
+            today: FiiDiiActivity(
+                today, Money.of("6000"), Money.of("4000"), Money.of("3000"), Money.of("3500")
+            ),
+            yesterday: FiiDiiActivity(
+                yesterday, Money.of("5000"), Money.of("4500"), Money.of("3000"), Money.of("2800")
+            ),
+        }
+
+    def get_latest(self) -> FiiDiiActivity:
+        latest_date = max(self.activity_by_date)
+        return self.activity_by_date[latest_date]
+
+    def get_by_date(self, activity_date: date) -> FiiDiiActivity:
+        if activity_date not in self.activity_by_date:
+            raise SymbolNotFoundError(f"no FII/DII data for {activity_date}")
+        return self.activity_by_date[activity_date]

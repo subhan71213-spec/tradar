@@ -1,70 +1,103 @@
-"""SQLite implementation of the JournalRepository port."""
-
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
 import json
-import sqlite3
-from datetime import datetime
 
-from titan_ai_trader.application.interfaces.journal_repository import JournalRepository
-from titan_ai_trader.domain.entities.journal import JournalEntry
+import pytest
+
+from titan_ai_trader.application.services.market_agent import (
+    FreshnessValidator,
+    MarketAgent,
+)
+from titan_ai_trader.application.services.market_data_service import MarketDataService
+from titan_ai_trader.domain.exceptions.market_data_exceptions import (
+    StaleMarketDataError,
+    SymbolNotFoundError,
+)
+from titan_ai_trader.infrastructure.market_data.cache.in_memory_cache import (
+    InMemoryMarketDataCache,
+)
+
+from .fakes import (
+    FakeFiiDiiProvider,
+    FakeOptionChainProvider,
+    FakeSpotProvider,
+    FakeVixProvider,
+)
 
 
-def _row_to_entry(row: sqlite3.Row) -> JournalEntry:
-    entry = JournalEntry(
-        content=row["content"],
-        trade_id=row["trade_id"],
-        tags=json.loads(row["tags"]),
-        id=row["id"],
+def _build_agent(**overrides) -> MarketAgent:
+    service = MarketDataService(
+        overrides.get("spot", FakeSpotProvider()),
+        overrides.get("chain", FakeOptionChainProvider()),
+        FakeVixProvider(),
+        overrides.get("fii_dii", FakeFiiDiiProvider()),
+        InMemoryMarketDataCache(),
     )
-    entry.created_at = datetime.fromisoformat(row["created_at"])
-    entry.updated_at = datetime.fromisoformat(row["updated_at"])
-    return entry
+    return MarketAgent(service, freshness_validator=overrides.get("freshness_validator"))
 
 
-class SQLiteJournalRepository(JournalRepository):
-    def __init__(self, connection: sqlite3.Connection) -> None:
-        self._conn = connection
+def test_analyze_index_is_case_insensitive_and_bundles_all_data():
+    agent = _build_agent()
+    report = agent.analyze_index("nifty")
+    assert report.index.key == "NIFTY"
+    assert report.spot.last_price.amount == Decimal("24300")
+    assert report.pcr.total_call_open_interest == 3000
+    assert report.max_pain.max_pain_strike is not None
+    assert report.oi_change.total_call_oi_change == 150
 
-    def save(self, entry: JournalEntry) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO journal_entries (
-                id, content, trade_id, tags, created_at, updated_at
-            ) VALUES (
-                :id, :content, :trade_id, :tags, :created_at, :updated_at
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                content=excluded.content,
-                tags=excluded.tags,
-                updated_at=excluded.updated_at
-            """,
-            {
-                "id": entry.id,
-                "content": entry.content,
-                "trade_id": entry.trade_id,
-                "tags": json.dumps(entry.tags),
-                "created_at": entry.created_at.isoformat(),
-                "updated_at": entry.updated_at.isoformat(),
-            },
+
+def test_unsupported_index_raises_symbol_not_found():
+    agent = _build_agent()
+    with pytest.raises(SymbolNotFoundError):
+        agent.analyze_index("SENSEX")
+
+
+def test_stale_spot_or_option_chain_data_is_rejected():
+    stale_time = datetime.now(UTC) - timedelta(minutes=30)
+    agent = _build_agent(
+        spot=FakeSpotProvider(timestamp=stale_time),
+        chain=FakeOptionChainProvider(timestamp=stale_time),
+        freshness_validator=FreshnessValidator(max_live_data_age_seconds=300),
+    )
+    with pytest.raises(StaleMarketDataError):
+        agent.analyze_index("NIFTY")
+
+
+def test_stale_fii_dii_activity_is_rejected():
+    from datetime import date
+
+    from titan_ai_trader.domain.entities.fii_dii_activity import FiiDiiActivity
+    from titan_ai_trader.domain.value_objects.money import Money
+
+    old_activity = {
+        date(2026, 6, 1): FiiDiiActivity(
+            date(2026, 6, 1), Money.of("5000"), Money.of("3000"), Money.of("2000"), Money.of("2500")
         )
-        self._conn.commit()
+    }
+    agent = _build_agent(fii_dii=FakeFiiDiiProvider(activity_by_date=old_activity))
+    with pytest.raises(StaleMarketDataError):
+        agent.analyze_fii_dii()
 
-    def get_by_id(self, entry_id: str) -> JournalEntry | None:
-        row = self._conn.execute(
-            "SELECT * FROM journal_entries WHERE id = ?", (entry_id,)
-        ).fetchone()
-        return _row_to_entry(row) if row else None
 
-    def list_all(self) -> list[JournalEntry]:
-        rows = self._conn.execute(
-            "SELECT * FROM journal_entries ORDER BY created_at DESC"
-        ).fetchall()
-        return [_row_to_entry(row) for row in rows]
+def test_market_snapshot_json_round_trips_through_json_dumps():
+    agent = _build_agent()
+    snapshot_json = agent.get_market_snapshot_json()
 
-    def list_by_trade(self, trade_id: str) -> list[JournalEntry]:
-        rows = self._conn.execute(
-            "SELECT * FROM journal_entries WHERE trade_id = ? ORDER BY created_at DESC",
-            (trade_id,),
-        ).fetchall()
-        return [_row_to_entry(row) for row in rows]
+    assert "nifty" in snapshot_json
+    assert "banknifty" in snapshot_json
+    assert "fii_dii" in snapshot_json
+    assert isinstance(snapshot_json["nifty"]["option_chain"]["contracts"], list)
+
+    # The real contract test for ai_brain.py: this must actually be JSON.
+    reparsed = json.loads(json.dumps(snapshot_json))
+    assert reparsed == snapshot_json
+
+
+def test_market_snapshot_json_string_matches_dict_shape():
+    agent = _build_agent()
+    as_string = agent.get_market_snapshot_json_string()
+    reparsed = json.loads(as_string)
+    assert set(reparsed.keys()) == {"nifty", "banknifty", "fii_dii", "generated_at"}
