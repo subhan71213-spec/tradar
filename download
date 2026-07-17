@@ -1,0 +1,10 @@
+"""Option contract type."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+
+class OptionType(StrEnum):
+    CE = "CE"  # Call European (NSE convention for call options)
+    PE = "PE"  # Put European (NSE convention for put options)

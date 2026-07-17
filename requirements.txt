@@ -1,0 +1,27 @@
+# Titan AI Trader — requirements.txt
+#
+# This project deliberately has ZERO third-party runtime dependencies.
+# Every HTTP call (NSE adapters, NewsAPI, Google News RSS, economic
+# calendar, Yahoo Finance quotes, Telegram Bot API — including the
+# interactive /start /help /status command bot's long-polling) is built
+# on Python's standard library (urllib, xml.etree, csv, json, asyncio)
+# rather than requests/httpx/aiohttp/python-telegram-bot/aiogram. This
+# was a conscious choice, not an oversight: it keeps the project
+# runnable and testable in any bare Python 3.12+ environment with no
+# install step and no risk of dependency drift -- and it's specifically
+# what kept this project's Render deployment simple after an earlier
+# packaging failure caused by unnecessary install complexity (see
+# project_final_report.md).
+#
+# If you prefer requests/httpx or a bot framework for your own
+# deployment, every network call is isolated behind a small provider
+# class (see infrastructure/market_data/http/nse_http_client.py and the
+# *Provider classes in news_agent.py / market_sentiment_agent.py /
+# telegram_formatter.py / telegram_bot.py) — swapping the transport is a
+# localized change, not a rewrite.
+
+# --- Runtime dependencies ---
+# (none — standard library only)
+
+# --- Development / testing dependencies ---
+pytest>=8.0

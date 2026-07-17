@@ -1,0 +1,88 @@
+# render.yaml — Render Blueprint for Titan AI Trader
+#
+# Deploys as a Web Service (not a Background Worker) specifically so
+# Render's HTTP health check can hit the /health endpoint main.py
+# serves on $PORT. Render injects PORT automatically for Web Services;
+# main.py reads it directly from the environment and only starts the
+# health-check server if PORT is set, so this same main.py also works
+# unmodified as a Background Worker (just remove the health check
+# config below and change `type: web` to `type: worker`).
+#
+# Deploy: connect this repo in the Render dashboard and choose
+# "Apply from render.yaml" (Blueprint), or `render blueprint launch`
+# via the Render CLI. No manual code changes are required.
+
+services:
+  - type: web
+    name: titan-ai-trader
+    runtime: python
+    plan: starter
+    region: singapore
+    branch: main
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && python -m compileall .
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: TZ
+        value: Asia/Kolkata
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_DIR
+        value: /var/data/logs
+
+      # --- Persistence (Phase 1) ---
+      - key: TITAN_DB_PATH
+        value: /var/data/titan_paper_trading.db
+      - key: TITAN_STARTING_CASH
+        value: "100000"
+
+      # --- Market data layer (Phase 2) ---
+      - key: TITAN_MARKET_DATA_TIMEOUT
+        value: "10.0"
+      - key: TITAN_MARKET_DATA_MAX_RETRIES
+        value: "3"
+
+      # --- Symbols + risk parameters (strategy_agent.py) ---
+      - key: TITAN_SYMBOLS
+        value: "NIFTY,BANKNIFTY"
+      - key: TITAN_CAPITAL
+        value: "100000"
+      - key: TITAN_RISK_PER_TRADE_PCT
+        value: "1.0"
+      - key: TITAN_NIFTY_LOT_SIZE
+        value: "75"
+      - key: TITAN_BANKNIFTY_LOT_SIZE
+        value: "30"
+
+      # --- Secrets: set these in the Render dashboard (Environment
+      # tab), not in this file. `sync: false` means Render will prompt
+      # for a value on first deploy and will not store it in git. ---
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: NEWS_API_KEY
+        sync: false
+      - key: NSE_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CLAUDE_API_KEY
+        sync: false
+
+    # Persistent disk for the SQLite database and rotating log files.
+    # Without this, both reset on every deploy/restart (Render's default
+    # filesystem is ephemeral). Requires a paid plan; on the free plan,
+    # remove this block and set TITAN_DB_PATH / LOG_DIR to a path under
+    # the ephemeral filesystem (e.g. ./titan_paper_trading.db, ./logs) --
+    # the app runs fine either way, it just won't retain history across
+    # restarts without the disk.
+    disk:
+      name: titan-data
+      mountPath: /var/data
+      sizeGB: 1

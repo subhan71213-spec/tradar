@@ -1,0 +1,10 @@
+"""Direction of a trade."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+
+class TradeSide(StrEnum):
+    LONG = "LONG"
+    SHORT = "SHORT"
